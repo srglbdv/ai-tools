@@ -33,7 +33,7 @@ echo "PostgreSQL is up and running!"
 
 # Wait for Neo4j to be ready
 echo "Waiting for Neo4j to be ready..."
-until curl -s http://neo4j:7474/browser/ > /dev/null; do
+until curl -s http://neo4j-vcs0ogg80g000o0kksgos884:7474/browser/ > /dev/null; do
   echo "Neo4j is unavailable - sleeping 2s"
   sleep 2
 done
