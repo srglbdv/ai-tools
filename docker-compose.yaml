@@ -52,14 +52,7 @@ services:
       - TOKEN_SECRET=${TOKEN_SECRET}
       - TOKEN_EXPIRE_HOURS=48
       - WHITELIST_PATHS=/health,/api/*
-    depends_on:
-      - neo4j
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9621/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+    
 
   neo4j:
     image: neo4j:5.16.0
@@ -77,12 +70,7 @@ services:
       - neo4j-logs:/logs
       - neo4j-plugins:/plugins
       - neo4j-import:/import
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
+    
 
 volumes:
   neo4j-data:
