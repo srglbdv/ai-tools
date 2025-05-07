@@ -3,7 +3,6 @@ services:
     build:
       context: .
       dockerfile: ./Dockerfile
-    container_name: lightrag-mcp-server
     restart: unless-stopped
     volumes:
       - ./data:/app/data
@@ -53,14 +52,11 @@ services:
       - TOKEN_SECRET=${TOKEN_SECRET}
       - TOKEN_EXPIRE_HOURS=48
       - WHITELIST_PATHS=/health,/api/*
-    
 
-  neo4j:
+  lightrag-neo4j:
     image: neo4j:5.16.0
-    container_name: lightrag-neo4j
     restart: unless-stopped
     environment:
-      - SERVICE_FQDN_NEO4J_7687
       - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_apoc_export_file_enabled=true
@@ -72,7 +68,6 @@ services:
       - neo4j-logs:/logs
       - neo4j-plugins:/plugins
       - neo4j-import:/import
-    
 
 volumes:
   neo4j-data:
