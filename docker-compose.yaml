@@ -54,7 +54,7 @@ services:
     image: neo4j:5.26.4-community
     restart: unless-stopped
     environment:
-      - NEO4J_AUTH=${NEO4J_USERNAME}/${NEO4J_PASSWORD}
+      - NEO4J_AUTH=${NEO4J_AUTH}
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_apoc_export_file_enabled=true
       - NEO4J_apoc_import_file_enabled=true
