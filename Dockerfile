@@ -18,8 +18,6 @@ RUN git clone https://github.com/HKUDS/LightRAG.git .
 # Install dependencies and LightRAG with API support
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir -r lightrag/api/requirements.txt \
-    && pip uninstall -y graspologic \
-    && pip install --no-cache-dir graspologic==0.3.0 \
     && pip install --no-cache-dir -e ".[api]" \
     && pip install --no-cache-dir anthropic openai psycopg2-binary neo4j asyncpg
 
