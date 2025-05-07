@@ -53,7 +53,7 @@ services:
       - TOKEN_EXPIRE_HOURS=48
       - WHITELIST_PATHS=/health,/api/*
 
-  lightrag-neo4j:
+  neo4j:
     image: neo4j:5.16.0
     restart: unless-stopped
     environment:
