@@ -54,7 +54,7 @@ services:
     image: neo4j:2025.04.0
     restart: unless-stopped
     environment:
-      - NEO4J_AUTH=${NEO4J_USERNAME}/${NEO4J_PASSWORD}
+      - NEO4J_AUTH=${AUTH_NEO4J}
       - NEO4J_server_config_strict_validation_enabled=false
       - NEO4J_server_bolt_listen__address=0.0.0.0:7687
       - NEO4J_server_bolt_advertised__address=neo4j:7687
