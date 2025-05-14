@@ -1,0 +1,324 @@
+# LightRAG for Coolify with PostgreSQL, DozerDB, and MCP Integration
+
+This repository contains a complete Dockerized setup for running LightRAG on Coolify. It uses PostgreSQL for document storage and vector embeddings, DozerDB (a Neo4j variant) for knowledge graph management, and includes a Model Context Protocol (MCP) server for AI assistant integration. The setup is designed to work with existing PostgreSQL or Supabase databases and can integrate with n8n for workflow automation. It uses OpenAI models via their standard APIs.
+
+**Key Features:**
+- Complete RAG system with knowledge graph capabilities
+- MCP server for direct integration with AI assistants like Claude
+- Support for existing PostgreSQL/Supabase databases
+- n8n integration for workflow automation
+- Coolify deployment with automatic domain generation
+
+## What is LightRAG?
+
+LightRAG is a powerful Retrieval-Augmented Generation (RAG) system developed by the HKU Data Science Lab. It combines knowledge graphs with vector retrieval, efficiently processing textual knowledge while capturing structured relationships between information by incorporating graph structures into text indexing and retrieval processes.
+
+Key features:
+- Graph-based text indexing for comprehensive information retrieval
+- Dual-level retrieval mechanism that handles both specific and abstract queries
+- Multiple retrieval modes for different use cases
+- Integration with cloud-based LLM models from OpenAI and Anthropic
+- PostgreSQL for document storage and vector embeddings
+- Neo4j for knowledge graph storage and querying
+
+## Components
+
+This setup includes:
+
+1. **LightRAG API Server**: Provides Web UI and API support for document indexing, knowledge graph exploration, and RAG queries. Includes built-in support for PostgreSQL storage.
+2. **DozerDB (Neo4j variant)**: Stores and manages the knowledge graph with entities and relationships. We specifically chose DozerDB for its ability to create databases, which enhances the flexibility and functionality of the knowledge graph management.
+3. **MCP Server**: Provides Model Context Protocol integration for AI assistants like Claude, enabling programmatic interaction with LightRAG through specialized tools.
+
+## Quick Start
+
+### Prerequisites
+
+- Coolify instance
+- OpenAI API key
+- Existing PostgreSQL or Supabase database
+
+### Setup Instructions
+
+1. In your Coolify instance, create a new service using this repository.
+
+2. Configure the required environment variables:
+   - `LLM_BINDING_API_KEY`: Your OpenAI API key
+   - `EMBEDDING_BINDING_API_KEY`: Your OpenAI API key (can be the same as above)
+   - `SERVICE_PASSWORD_NEO4J`: Password for the Neo4j database
+   - `SERVICE_PASSWORD_LIGHTRAG`: Password for the LightRAG admin user
+   - `SERVICE_BASE64_LIGHTRAG`: Base64-encoded API key for LightRAG
+   - `SERVICE_REALBASE64_TOKEN`: Base64-encoded secret for JWT tokens
+
+3. If you want to use an existing PostgreSQL or Supabase database, configure these variables:
+   - `POSTGRES_HOST`: Your PostgreSQL host
+   - `POSTGRES_PORT`: Your PostgreSQL port (default: 5432)
+   - `POSTGRES_USER`: Your PostgreSQL username
+   - `POSTGRES_PASSWORD`: Your PostgreSQL password
+   - `POSTGRES_DATABASE`: Your PostgreSQL database name
+
+4. Deploy the service in Coolify.
+
+5. The services will be available at:
+   - LightRAG API Server: https://your-coolify-domain.com
+   - LightRAG Web UI: https://your-coolify-domain.com/ui
+   - DozerDB Browser: Not directly accessible (internal to the Docker network)
+
+### Initializing LightRAG with Documents
+
+1. Access the LightRAG Web UI at your Coolify domain
+2. Log in using the admin credentials you set in the environment variables
+3. Upload your documents through the interface
+4. Monitor the document indexing process
+
+## Database Configuration
+
+### PostgreSQL/Supabase Integration
+
+This setup supports connecting to existing PostgreSQL or Supabase databases.
+- Ensure the Supabase PostgreSQL instance has the pgvector extension enabled
+- The LightRAG service will automatically create the necessary tables and indexes
+
+### DozerDB Configuration
+
+This setup uses DozerDB (a Neo4j variant) for knowledge graph storage. DozerDB was specifically chosen for its ability to create databases, which provides enhanced flexibility for knowledge graph management. The configuration includes:
+
+- APOC plugin enabled for advanced graph operations
+- File import/export capabilities
+- Unrestricted security procedures for full functionality
+
+## MCP Server Integration
+
+This setup includes a Model Context Protocol (MCP) server that provides direct integration with LightRAG through AI assistants like Claude. The MCP server exposes tools that allow AI assistants to interact with your LightRAG deployment programmatically.
+
+### Available MCP Tools
+
+The MCP server provides the following tools:
+
+1. **query_lightrag**: Query the LightRAG knowledge base
+   - Parameters:
+     - `query`: The query to send to LightRAG
+     - `mode`: Retrieval mode (local, global, hybrid, mix, naive)
+
+2. **list_documents**: List all documents in LightRAG
+   - Parameters:
+     - `limit`: Maximum number of documents to return (default: 10)
+     - `offset`: Number of documents to skip (default: 0)
+
+3. **upload_document**: Upload a document to LightRAG
+   - Parameters:
+     - `content`: Document content
+     - `filename`: Document filename
+     - `metadata`: Optional document metadata
+
+4. **get_document_status**: Get the processing status of a document
+   - Parameters:
+     - `document_id`: Document ID
+
+5. **delete_document**: Delete a document from LightRAG
+   - Parameters:
+     - `document_id`: Document ID
+
+### Setting Up MCP Integration
+
+The MCP server is exposed via HTTP with the standard SSE endpoint (`/sse`) and requires authentication. Here's how to connect:
+
+#### Connecting from AI Assistants
+
+To use the MCP server with an AI assistant like Claude:
+
+1. Configure your MCP settings file to connect to the LightRAG MCP server via HTTP:
+   ```json
+   {
+     "mcpServers": {
+       "lightrag": {
+         "url": "https://your-coolify-domain.com/sse",
+         "headers": {
+           "Authorization": "Bearer your-lightrag-api-key"
+         },
+         "disabled": false,
+         "autoApprove": []
+       }
+     }
+   }
+   ```
+
+2. The AI assistant will now have access to the LightRAG tools and can use them to interact with your knowledge base.
+
+#### Connecting from n8n
+
+To connect n8n to the LightRAG MCP server:
+
+1. In your n8n workflow, add an MCP node (already available in n8n by default)
+2. Configure a new MCP HTTP connection:
+   - **Connection Name**: "LightRAG MCP"
+   - **Server URL**: The URL where your MCP server is accessible (e.g., `https://your-coolify-domain.com/sse`)
+   - **Authentication**: Select "Bearer Token"
+   - **Token**: Your LightRAG API key (the value you set for SERVICE_BASE64_LIGHTRAG)
+
+The MCP server is automatically assigned a domain by Coolify through the `SERVICE_FQDN_MCP_3000` environment variable. This makes it accessible via HTTPS at your Coolify domain.
+
+## Integrating with n8n
+
+You can integrate this LightRAG deployment with n8n using the MCP integration:
+
+### Method 1: Using MCP Node in n8n
+
+1. Add an MCP node to your workflow:
+   - Search for "MCP" in the nodes panel
+   - Add the MCP node to your workflow
+
+2. Configure the MCP node:
+   - Select "LightRAG" as the MCP server
+   - Choose the operation you want to perform (query, upload document, etc.)
+   - Configure the parameters for the selected operation
+   - Connect the node to other actions in your workflow
+
+This approach provides a more user-friendly interface for interacting with LightRAG compared to raw HTTP requests.
+
+### Method 2: Using HTTP Request Node
+
+Alternatively, you can still use the HTTP Request node:
+
+1. In your n8n instance, create a new workflow
+2. Add an HTTP Request node
+3. Configure it to point to the LightRAG API endpoint: `https://your-coolify-domain.com/api/query`
+4. Set the method to POST and body to JSON with the following structure:
+   ```json
+   {
+     "query": "Your question here",
+     "mode": "hybrid"
+   }
+   ```
+5. Add the X-API-Key header with your LightRAG API key (the value you set for SERVICE_BASE64_LIGHTRAG)
+6. Connect this node to other actions in your workflow
+
+## Database Schema
+
+### PostgreSQL
+
+The PostgreSQL database includes several tables:
+- `lightrag_doc_status`: Tracks document processing status
+- `lightrag_doc_full`: Stores original documents
+- `lightrag_doc_chunks`: Stores document chunks for processing
+- `lightrag_llm_cache`: Caches LLM responses for efficiency
+- `lightrag_vdb_entity`: Stores entity information for vector database
+- `lightrag_vdb_relation`: Stores relationship information for vector database
+
+### DozerDB (Neo4j)
+
+The DozerDB database stores:
+- Entities as nodes with properties like entity type, description, and source
+- Relationships between entities with properties like weight, description, and keywords
+- Custom tables for enhanced knowledge representation (a key advantage of DozerDB over standard Neo4j)
+
+## Configuration Options
+
+### Storage Configuration
+
+This setup uses a flexible storage configuration that can be adjusted via environment variables:
+- `LIGHTRAG_KV_STORAGE`: Key-value storage backend (default: PGKVStorage)
+- `LIGHTRAG_VECTOR_STORAGE`: Vector storage backend (default: PGVectorStorage)
+- `LIGHTRAG_GRAPH_STORAGE`: Graph storage backend (default: Neo4JStorage)
+- `LIGHTRAG_DOC_STATUS_STORAGE`: Document status storage backend (default: PGDocStatusStorage)
+
+### API Models
+
+This setup uses the following models by default:
+- LLM: `gpt-4.1-mini` from OpenAI
+- Embedding: `text-embedding-3-large` from OpenAI
+
+You can modify these in the environment variables to use different models:
+- For cheaper usage: Switch to `gpt-3.5-turbo`
+- For embedding: Use `text-embedding-3-small` for lower cost
+- You can also adjust token limits and other parameters to manage API costs:
+  - `MAX_TOKENS`: Maximum tokens for LLM responses (default: 32768)
+  - `TEMPERATURE`: Temperature for LLM responses (default: 0.0)
+  - `MAX_ASYNC`: Maximum parallel LLM requests (default: 4)
+
+### Document Processing
+
+The setup includes several configuration options for document processing:
+- `ENABLE_LLM_CACHE_FOR_EXTRACT`: Enable caching for LLM extraction (default: true)
+- `MAX_PARALLEL_INSERT`: Maximum parallel document insertions (default: 2)
+- `SUMMARY_LANGUAGE`: Language for document summaries (default: English)
+- `CHUNK_SIZE`: Size of document chunks (default: 1200)
+- `CHUNK_OVERLAP_SIZE`: Overlap between chunks (default: 100)
+
+### Authentication
+
+The LightRAG server is protected with:
+1. API key authentication for API endpoints
+2. JWT-based user authentication for the Web UI
+
+Configuration is done via the environment variables:
+- `LIGHTRAG_API_KEY`: API key for authentication
+- `AUTH_ACCOUNTS`: User accounts (format: username:password)
+- `TOKEN_SECRET`: Secret for JWT tokens
+- `TOKEN_EXPIRE_HOURS`: JWT token expiration (default: 48 hours)
+
+## Query Modes
+
+LightRAG supports different retrieval modes for various use cases , depending on the specific scenario:
+
+- **local**: Focus on retrieving specific entities
+- **global**: Focus on finding relationship patterns
+- **hybrid**: Combine both local and global retrieval (recommended for most cases)
+- **mix**: Use both approaches in parallel
+- **naive**: Simple vector-based retrieval without graph enhancement
+
+You can specify the mode in your API requests to LightRAG.
+
+## Health Checks and Reliability
+
+This setup includes health checks for the core services:
+
+- **LightRAG**: Checks the `/health` endpoint every 10 seconds
+- **DozerDB**: Checks the web interface availability every 10 seconds
+- **MCP Server**: Depends on LightRAG's health check to ensure it only starts when LightRAG is ready
+
+All services are configured with `restart: unless-stopped` to ensure they automatically recover from temporary failures.
+
+## Troubleshooting
+
+### Common Issues
+
+1. **API key issues**: Verify your OpenAI API keys are correctly set in the environment variables
+2. **Rate limiting**: If you hit OpenAI rate limits, consider adjusting the MAX_ASYNC parameter
+3. **Connection problems**: Check Coolify network configurations and firewall settings
+4. **Database connectivity**: If using an external PostgreSQL/Supabase database, ensure it's accessible from the Coolify network
+5. **DozerDB issues**: Check the DozerDB logs for any graph database related errors
+6. **MCP server issues**: If the MCP server is not responding, check that LightRAG is healthy and that the API key is correctly configured
+7. **MCP authentication issues**: Ensure the Bearer token in your MCP connection settings matches exactly with the LightRAG API key (SERVICE_BASE64_LIGHTRAG)
+
+### Logs
+
+Access logs for debugging through the Coolify interface:
+- Navigate to your service in Coolify
+- Click on "Logs" to view the container logs
+- You can filter logs by container (lightrag, neo4j, or lightrag-mcp)
+
+## Advanced Usage
+
+### Custom Knowledge Graphs
+
+LightRAG allows importing custom knowledge graphs. Create a JSON file with your entities and relationships, then import it using the API or Web UI. The DozerDB backend provides enhanced capabilities for complex knowledge graph operations.
+
+### Cost Management
+
+To manage API costs:
+- Use smaller embedding models for less critical applications
+- Reduce token limits for cheaper API usage
+- Enable caching to reuse previous LLM responses
+- Adjust MAX_PARALLEL_INSERT to control the rate of document processing
+- Consider using a smaller LLM model like gpt-3.5-turbo for less complex queries
+
+## References
+
+- [LightRAG GitHub Repository](https://github.com/HKUDS/LightRAG)
+- [Coolify Documentation](https://coolify.io/docs)
+- [OpenAI API Documentation](https://platform.openai.com/docs/api-reference)
+- [PostgreSQL pgvector Documentation](https://github.com/pgvector/pgvector)
+- [DozerDB Documentation](https://dozerdb.org/docs)
+- [n8n Documentation](https://docs.n8n.io)
+- [Supabase Documentation](https://supabase.com/docs)
+- [Model Context Protocol Documentation](https://modelcontextprotocol.github.io/docs/)

@@ -1,0 +1,563 @@
+services:
+  lightrag:
+    build:
+      context: .
+      dockerfile_inline: |
+        # Build stage
+        FROM python:3.12-slim-bookworm AS builder
+
+        WORKDIR /app
+
+        # Install Rust and required build dependencies
+        RUN apt-get update && apt-get install -y \
+            curl \
+            build-essential \
+            pkg-config \
+            git \
+            && rm -rf /var/lib/apt/lists/* \
+            && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+            && . $HOME/.cargo/env
+
+        # Clone LightRAG repository 
+        RUN git clone https://github.com/HKUDS/LightRAG.git .
+
+        # Install dependencies
+        ENV PATH="/root/.cargo/bin:${PATH}"
+        RUN pip install --user --no-cache-dir -r requirements.txt \
+            && pip install --user --no-cache-dir -r lightrag/api/requirements.txt
+
+        # Final stage
+        FROM python:3.12-slim-bookworm
+
+        WORKDIR /app
+
+        RUN apt-get update && apt-get install -y \
+            curl
+
+        # Copy only necessary files from builder
+        COPY --from=builder /root/.local /root/.local
+        COPY --from=builder /app/lightrag ./lightrag
+        COPY --from=builder /app/setup.py .
+
+        RUN pip install .
+
+        # Make sure scripts in .local are usable
+        ENV PATH=/root/.local/bin:$PATH
+
+        # Create necessary directories
+        RUN mkdir -p /app/data /app/data/working_dir /app/config
+
+        # Expose the default port
+        EXPOSE 9621
+    restart: unless-stopped
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    environment:
+      - SERVICE_FQDN_LIGHTRAG_9621
+      - WEBUI_TITLE=LightRAG
+      - WEBUI_DESCRIPTION=Simple and Fast Graph Based RAG System
+      # Settings for document indexing
+      - ENABLE_LLM_CACHE_FOR_EXTRACT=${ENABLE_LLM_CACHE_FOR_EXTRACT:-true}
+      - MAX_PARALLEL_INSERT=${MAX_PARALLEL_INSERT:-2}
+      - SUMMARY_LANGUAGE=${SUMMARY_LANGUAGE:-English}
+      - CHUNK_SIZE=${CHUNK_SIZE:-1200}
+      - CHUNK_OVERLAP_SIZE=${CHUNK_OVERLAP_SIZE:-100}
+      # LLM Configuration
+      - TIMEOUT=${TIMEOUT:-200}
+      - TEMPERATURE=${TEMPERATURE:-0.0}
+      - MAX_ASYNC=${MAX_ASYNC:-4}
+      - MAX_TOKENS=${MAX_TOKENS:-32768}
+      - LLM_BINDING=${LLM_BINDING:-openai}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4.1-mini}
+      - LLM_BINDING_HOST=${LLM_BINDING_HOST:-https://api.openai.com/v1}
+      - LLM_BINDING_API_KEY=${LLM_BINDING_API_KEY}
+      # Embedding Configuration - Using OpenAI for embeddings
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-large}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-1536}
+      - EMBEDDING_BINDING=${EMBEDDING_BINDING:-openai}
+      - EMBEDDING_BINDING_HOST=${EMBEDDING_BINDING_HOST:-https://api.openai.com/v1}
+      - EMBEDDING_BINDING_API_KEY=${EMBEDDING_BINDING_API_KEY}
+      # Storage Configuration
+      - LIGHTRAG_KV_STORAGE=PGKVStorage
+      - LIGHTRAG_VECTOR_STORAGE=PGVectorStorage
+      - LIGHTRAG_GRAPH_STORAGE=Neo4JStorage
+      - LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage
+      # PostgreSQL Configuration
+      - POSTGRES_HOST=${POSTGRES_HOST:-postgres}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DATABASE=${POSTGRES_DATABASE:-postgres}
+      # Neo4j Configuration
+      - NEO4J_URI=${NEO4J_URI:-bolt://neo4j:7687}
+      - NEO4J_USERNAME=neo4j
+      - NEO4J_PASSWORD=${SERVICE_PASSWORD_NEO4J}
+      # Authentication
+      - LIGHTRAG_API_KEY=${SERVICE_BASE64_LIGHTRAG}
+      - AUTH_ACCOUNTS=admin:${SERVICE_PASSWORD_LIGHTRAG}
+      - TOKEN_SECRET=${SERVICE_REALBASE64_TOKEN}
+      - TOKEN_EXPIRE_HOURS=${TOKEN_EXPIRE_HOURS:-48}
+      - WHITELIST_PATHS=/health,/api/*
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9621/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    entrypoint: ["python", "-m", "lightrag.api.lightrag_server"]
+
+  neo4j:
+    image: graphstack/dozerdb:5.26.3.0
+    restart: unless-stopped
+    environment:
+      - SERVICE_FQDN_NEO4J_7474
+      - NEO4J_AUTH=neo4j/${SERVICE_PASSWORD_NEO4J}
+      - NEO4J_PLUGINS='["apoc"]'
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_dbms_security_procedures_unrestricted='*'
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+      - neo4j-plugins:/plugins
+      - neo4j-import:/var/lib/neo4j/import
+    healthcheck:
+      test: wget http://localhost:7474 || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mcp:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM node:24-slim
+        
+        WORKDIR /app
+        
+        # Install dependencies in a single layer to reduce image size
+        RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+        
+        # Install dependencies including express for HTTP server
+        COPY ./mcp/package.json .
+
+        # Install dependencies
+        RUN npm install
+        
+        # Create TypeScript config and source files
+        COPY ./mcp/tsconfig.json .
+        COPY ./mcp/src ./src
+        
+        # Build TypeScript code
+        RUN npm run build
+        
+        # Expose HTTP port
+        EXPOSE 3000
+    volumes:
+      - type: bind
+        source: ./mcp/package.json
+        target: /app/package.json
+        content: |
+          {
+            "name": "lightrag-mcp-server",
+            "version": "0.1.0",
+            "type": "module",
+            "scripts": {
+              "build": "tsc && chmod +x build/index.js",
+              "start": "node build/index.js"
+            },
+            "dependencies": {
+              "@modelcontextprotocol/sdk": "^1.11.0",
+              "axios": "^1.6.0",
+              "express": "^4.18.2",
+              "form-data": "^4.0.0",
+              "zod": "^3.22.4"
+            },
+            "devDependencies": {
+              "@types/express": "^4.17.17",
+              "@types/node": "^20.4.5",
+              "typescript": "^5.0.0"
+            }
+          }
+      - type: bind
+        source: ./mcp/tsconfig.json
+        target: /app/tsconfig.json
+        content: |
+          {
+            "compilerOptions": {
+              "target": "ES2020",
+              "module": "NodeNext",
+              "moduleResolution": "NodeNext",
+              "esModuleInterop": true,
+              "outDir": "build",
+              "strict": true,
+              "skipLibCheck": true,
+              "resolveJsonModule": true
+            },
+            "include": ["src/**/*"]
+          }
+      - type: bind
+        source: ./mcp/src/index.ts
+        target: /app/src/index.ts
+        content: |
+          #!/usr/bin/env node
+          import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+          import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+          import { Request, Response } from "express";
+          import express from "express";
+          import axios from "axios";
+          import FormData from "form-data";
+          import { z } from "zod";
+
+          const API_URL = process.env.LIGHTRAG_API_URL || "http://lightrag:9621";
+          const API_KEY = process.env.LIGHTRAG_API_KEY;
+          const PORT = process.env.PORT || 3000;
+
+          if (!API_KEY) {
+            throw new Error("LIGHTRAG_API_KEY environment variable is required");
+          }
+
+          // Define types for parameters
+          type QueryLightRAGParams = {
+            query: string;
+            mode?: "local" | "global" | "hybrid" | "mix" | "naive";
+          };
+
+          type ListDocumentsParams = {
+            limit?: number;
+            offset?: number;
+          };
+
+          type UploadDocumentParams = {
+            content: string;
+            filename: string;
+            metadata?: Record<string, any>;
+          };
+
+          type DocumentIdParams = {
+            document_id: string;
+          };
+
+          // Function to create a new server instance
+          function getServer() {
+            const server = new McpServer({
+              name: "lightrag-mcp-server",
+              version: "0.1.0",
+            });
+            
+            // Set up tool handlers
+            server.tool(
+              "query_lightrag",
+              {
+                query: z.string().describe("The query to send to LightRAG"),
+                mode: z.enum(["local", "global", "hybrid", "mix", "naive"])
+                  .describe("Retrieval mode (local, global, hybrid, mix, naive)")
+                  .default("hybrid")
+                  .optional()
+              },
+              async ({ query, mode }) => {
+                const axiosInstance = axios.create({
+                  baseURL: API_URL,
+                  headers: {
+                    "X-API-Key": API_KEY as string,
+                    "Content-Type": "application/json",
+                  },
+                });
+                
+                const response = await axiosInstance.post("/api/query", {
+                  query,
+                  mode: mode || "hybrid",
+                });
+                
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify(response.data, null, 2),
+                    },
+                  ],
+                };
+              }
+            );
+            
+            server.tool(
+              "list_documents",
+              {
+                limit: z.number()
+                  .describe("Maximum number of documents to return")
+                  .default(10)
+                  .optional(),
+                offset: z.number()
+                  .describe("Number of documents to skip")
+                  .default(0)
+                  .optional()
+              },
+              async ({ limit, offset }) => {
+                const axiosInstance = axios.create({
+                  baseURL: API_URL,
+                  headers: {
+                    "X-API-Key": API_KEY as string,
+                    "Content-Type": "application/json",
+                  },
+                });
+                
+                const actualLimit = limit || 10;
+                const actualOffset = offset || 0;
+                
+                const response = await axiosInstance.get("/api/documents", {
+                  params: { limit: actualLimit, offset: actualOffset },
+                });
+                
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify(response.data, null, 2),
+                    },
+                  ],
+                };
+              }
+            );
+            
+            server.tool(
+              "upload_document",
+              {
+                content: z.string().describe("Document content"),
+                filename: z.string().describe("Document filename"),
+                metadata: z.record(z.any()).describe("Optional document metadata").optional()
+              },
+              async ({ content, filename, metadata }) => {
+                const axiosInstance = axios.create({
+                  baseURL: API_URL,
+                  headers: {
+                    "X-API-Key": API_KEY as string,
+                  },
+                });
+                
+                const formData = new FormData();
+                
+                // Create a Buffer from the content string
+                const buffer = Buffer.from(content);
+                formData.append("file", buffer, filename);
+                
+                if (metadata) {
+                  formData.append("metadata", JSON.stringify(metadata));
+                }
+                
+                const response = await axiosInstance.post("/api/documents", formData, {
+                  headers: {
+                    ...formData.getHeaders(),
+                  },
+                });
+                
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify(response.data, null, 2),
+                    },
+                  ],
+                };
+              }
+            );
+            
+            server.tool(
+              "get_document_status",
+              {
+                document_id: z.string().describe("Document ID")
+              },
+              async ({ document_id }) => {
+                const axiosInstance = axios.create({
+                  baseURL: API_URL,
+                  headers: {
+                    "X-API-Key": API_KEY as string,
+                    "Content-Type": "application/json",
+                  },
+                });
+                
+                const response = await axiosInstance.get(
+                  `/api/documents/${document_id}/status`
+                );
+                
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify(response.data, null, 2),
+                    },
+                  ],
+                };
+              }
+            );
+            
+            server.tool(
+              "delete_document",
+              {
+                document_id: z.string().describe("Document ID")
+              },
+              async ({ document_id }) => {
+                const axiosInstance = axios.create({
+                  baseURL: API_URL,
+                  headers: {
+                    "X-API-Key": API_KEY as string,
+                    "Content-Type": "application/json",
+                  },
+                });
+                
+                const response = await axiosInstance.delete(
+                  `/api/documents/${document_id}`
+                );
+                
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify(response.data, null, 2),
+                    },
+                  ],
+                };
+              }
+            );
+            
+            return server;
+          }
+
+          // Create Express app
+          const app = express();
+          app.use(express.json());
+
+          // Add health check endpoint
+          app.get('/health', (req: Request, res: Response) => {
+            res.status(200).send('OK');
+          });
+
+          // Add authentication middleware
+          function authenticate(req: Request, res: Response, next: Function) {
+            const authHeader = req.headers['authorization'];
+            if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+              return res.status(401).json({
+                jsonrpc: '2.0',
+                error: {
+                  code: -32001,
+                  message: 'Unauthorized',
+                },
+                id: null,
+              });
+            }
+            next();
+          }
+
+          // Simple logging function with timestamp
+          function log(message: string, level: 'info' | 'warn' | 'error' = 'info') {
+            const timestamp = new Date().toISOString();
+            const prefix = level === 'error' ? '❌ ERROR' : level === 'warn' ? '⚠️ WARNING' : '✅ INFO';
+            console.log(`[${timestamp}] ${prefix}: ${message}`);
+          }
+
+          // MCP endpoint with authentication - POST for client-to-server communication
+          app.post('/mcp', authenticate, async (req: Request, res: Response) => {
+            // In stateless mode, create a new instance of transport and server for each request
+            // to ensure complete isolation. A single instance would cause request ID collisions
+            // when multiple clients connect concurrently.
+            
+            const requestId = Math.random().toString(36).substring(2, 15);
+            log(`Received POST request to /mcp [ID: ${requestId}]`);
+            
+            try {
+              const server = getServer(); 
+              log(`Server instance created successfully [ID: ${requestId}]`);
+              
+              const transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: undefined,
+              });
+              log(`Transport created successfully [ID: ${requestId}]`);
+              
+              res.on('close', () => {
+                log(`Request closed [ID: ${requestId}]`);
+                transport.close();
+                server.close();
+              });
+              
+              await server.connect(transport);
+              log(`Server connected to transport [ID: ${requestId}]`);
+              
+              log(`Handling request [ID: ${requestId}]`);
+              await transport.handleRequest(req, res, req.body);
+              log(`Request handled successfully [ID: ${requestId}]`);
+            } catch (error) {
+              log(`Error handling MCP request [ID: ${requestId}]: ${error}`, 'error');
+              if (!res.headersSent) {
+                res.status(500).json({
+                  jsonrpc: '2.0',
+                  error: {
+                    code: -32603,
+                    message: 'Internal server error',
+                  },
+                  id: null,
+                });
+              }
+            }
+          });
+
+          // MCP endpoint with authentication - GET for server-to-client notifications
+          app.get('/mcp', authenticate, async (req: Request, res: Response) => {
+            const requestId = Math.random().toString(36).substring(2, 15);
+            log(`Received GET request to /mcp [ID: ${requestId}]`);
+            log(`GET method not allowed in stateless mode [ID: ${requestId}]`, 'warn');
+            
+            res.writeHead(405).end(JSON.stringify({
+              jsonrpc: "2.0",
+              error: {
+                code: -32000,
+                message: "Method not allowed in stateless mode."
+              },
+              id: null
+            }));
+          });
+
+          // MCP endpoint with authentication - DELETE for session termination
+          app.delete('/mcp', authenticate, async (req: Request, res: Response) => {
+            const requestId = Math.random().toString(36).substring(2, 15);
+            log(`Received DELETE request to /mcp [ID: ${requestId}]`);
+            log(`DELETE method not allowed in stateless mode [ID: ${requestId}]`, 'warn');
+            
+            res.writeHead(405).end(JSON.stringify({
+              jsonrpc: "2.0",
+              error: {
+                code: -32000,
+                message: "Method not allowed in stateless mode."
+              },
+              id: null
+            }));
+          });
+
+          // Start the server
+          app.listen(PORT, () => {
+            log(`LightRAG MCP Server started successfully`);
+            log(`Server is listening on port ${PORT}`);
+            log(`Health check endpoint available at http://localhost:${PORT}/health`);
+            log(`MCP endpoint available at http://localhost:${PORT}/mcp`);
+            log(`Server is ready to accept requests`);
+          });
+    environment:
+      - LIGHTRAG_API_URL=http://lightrag:9621
+      - LIGHTRAG_API_KEY=${SERVICE_BASE64_LIGHTRAG}
+      - PORT=3000
+      - SERVICE_FQDN_MCP_3000
+    entrypoint: ["npm", "start"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+volumes:
+  neo4j-data: null
+  neo4j-logs: null
+  neo4j-plugins: null
+  neo4j-import: null
