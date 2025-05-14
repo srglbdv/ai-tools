@@ -114,7 +114,6 @@ services:
     image: graphstack/dozerdb:5.26.3.0
     restart: unless-stopped
     environment:
-      - SERVICE_FQDN_NEO4J_7474
       - NEO4J_AUTH=neo4j/${SERVICE_PASSWORD_NEO4J}
       - NEO4J_PLUGINS='["apoc"]'
       - NEO4J_apoc_export_file_enabled=true
@@ -208,6 +207,7 @@ services:
           #!/usr/bin/env node
           import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
           import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+          import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
           import { Request, Response } from "express";
           import express from "express";
           import axios from "axios";
@@ -243,6 +243,12 @@ services:
             document_id: string;
           };
 
+          // Store transports for each session type
+          const transports = {
+            streamable: {} as Record<string, StreamableHTTPServerTransport>,
+            sse: {} as Record<string, SSEServerTransport>
+          };
+
           // Function to create a new server instance
           function getServer() {
             const server = new McpServer({
@@ -269,7 +275,7 @@ services:
                   },
                 });
                 
-                const response = await axiosInstance.post("/api/query", {
+                const response = await axiosInstance.post("/query", {
                   query,
                   mode: mode || "hybrid",
                 });
@@ -309,7 +315,7 @@ services:
                 const actualLimit = limit || 10;
                 const actualOffset = offset || 0;
                 
-                const response = await axiosInstance.get("/api/documents", {
+                const response = await axiosInstance.get("/documents", {
                   params: { limit: actualLimit, offset: actualOffset },
                 });
                 
@@ -349,7 +355,7 @@ services:
                   formData.append("metadata", JSON.stringify(metadata));
                 }
                 
-                const response = await axiosInstance.post("/api/documents", formData, {
+                const response = await axiosInstance.post("/documents", formData, {
                   headers: {
                     ...formData.getHeaders(),
                   },
@@ -381,7 +387,7 @@ services:
                 });
                 
                 const response = await axiosInstance.get(
-                  `/api/documents/${document_id}/status`
+                  `/documents/${document_id}/status`
                 );
                 
                 return {
@@ -394,36 +400,7 @@ services:
                 };
               }
             );
-            
-            server.tool(
-              "delete_document",
-              {
-                document_id: z.string().describe("Document ID")
-              },
-              async ({ document_id }) => {
-                const axiosInstance = axios.create({
-                  baseURL: API_URL,
-                  headers: {
-                    "X-API-Key": API_KEY as string,
-                    "Content-Type": "application/json",
-                  },
-                });
-                
-                const response = await axiosInstance.delete(
-                  `/api/documents/${document_id}`
-                );
-                
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: JSON.stringify(response.data, null, 2),
-                    },
-                  ],
-                };
-              }
-            );
-            
+
             return server;
           }
 
@@ -452,11 +429,11 @@ services:
             next();
           }
 
-          // Simple logging function with timestamp
+          // Simple logging function
           function log(message: string, level: 'info' | 'warn' | 'error' = 'info') {
             const timestamp = new Date().toISOString();
-            const prefix = level === 'error' ? '❌ ERROR' : level === 'warn' ? '⚠️ WARNING' : '✅ INFO';
-            console.log(`[${timestamp}] ${prefix}: ${message}`);
+            const prefix = level === 'error' ? 'ERROR' : level === 'warn' ? 'WARNING' : 'INFO';
+            console.log(`${prefix}: ${message}`);
           }
 
           // MCP endpoint with authentication - POST for client-to-server communication
@@ -504,20 +481,47 @@ services:
             }
           });
 
-          // MCP endpoint with authentication - GET for server-to-client notifications
+          // MCP endpoint with authentication - GET for server-to-client notifications and tool discovery
           app.get('/mcp', authenticate, async (req: Request, res: Response) => {
             const requestId = Math.random().toString(36).substring(2, 15);
             log(`Received GET request to /mcp [ID: ${requestId}]`);
-            log(`GET method not allowed in stateless mode [ID: ${requestId}]`, 'warn');
             
-            res.writeHead(405).end(JSON.stringify({
-              jsonrpc: "2.0",
-              error: {
-                code: -32000,
-                message: "Method not allowed in stateless mode."
-              },
-              id: null
-            }));
+            try {
+              // Create a server instance
+              const server = getServer();
+              log(`Server instance created successfully for tool discovery [ID: ${requestId}]`);
+              
+              // Respond with a simple success message for modern clients
+              // This is a simplified response since we don't have access to getMetadata, getTools, etc.
+              res.status(200).json({
+                jsonrpc: "2.0",
+                result: {
+                  server: {
+                    name: "lightrag-mcp-server",
+                    version: "0.1.0"
+                  }
+                },
+                id: null
+              });
+              
+              log(`Tool discovery response sent successfully [ID: ${requestId}]`);
+              
+              // Clean up
+              server.close();
+              
+            } catch (error) {
+              log(`Error handling GET request [ID: ${requestId}]: ${error}`, 'error');
+              if (!res.headersSent) {
+                res.status(500).json({
+                  jsonrpc: '2.0',
+                  error: {
+                    code: -32603,
+                    message: 'Internal server error',
+                  },
+                  id: null,
+                });
+              }
+            }
           });
 
           // MCP endpoint with authentication - DELETE for session termination
@@ -536,14 +540,83 @@ services:
             }));
           });
 
+          // Legacy SSE endpoint for older clients
+          app.get('/sse', authenticate, async (req: Request, res: Response) => {
+            const requestId = Math.random().toString(36).substring(2, 15);
+            log(`Received GET request to /sse [ID: ${requestId}]`);
+            
+            try {
+              const server = getServer();
+              log(`Server instance created successfully for SSE [ID: ${requestId}]`);
+              
+              // Create SSE transport for legacy clients
+              const transport = new SSEServerTransport('/messages', res);
+              transports.sse[transport.sessionId] = transport;
+              
+              res.on("close", () => {
+                log(`SSE connection closed [ID: ${requestId}]`);
+                delete transports.sse[transport.sessionId];
+                server.close();
+              });
+              
+              await server.connect(transport);
+              log(`Server connected to SSE transport [ID: ${requestId}]`);
+            } catch (error) {
+              log(`Error handling SSE request [ID: ${requestId}]: ${error}`, 'error');
+              if (!res.headersSent) {
+                res.status(500).send('Internal server error');
+              }
+            }
+          });
+
+          // Legacy message endpoint for older clients
+          app.post('/messages', authenticate, async (req: Request, res: Response) => {
+            const sessionId = req.query.sessionId as string;
+            const requestId = Math.random().toString(36).substring(2, 15);
+            log(`Received POST request to /messages with sessionId ${sessionId} [ID: ${requestId}]`);
+            
+            const transport = transports.sse[sessionId];
+            if (transport) {
+              try {
+                await transport.handlePostMessage(req, res, req.body);
+                log(`Message handled successfully [ID: ${requestId}]`);
+              } catch (error) {
+                log(`Error handling message [ID: ${requestId}]: ${error}`, 'error');
+                if (!res.headersSent) {
+                  res.status(500).json({
+                    jsonrpc: '2.0',
+                    error: {
+                      code: -32603,
+                      message: 'Internal server error',
+                    },
+                    id: null,
+                  });
+                }
+              }
+            } else {
+              log(`No transport found for sessionId ${sessionId} [ID: ${requestId}]`, 'warn');
+              res.status(400).json({
+                jsonrpc: '2.0',
+                error: {
+                  code: -32000,
+                  message: 'No transport found for sessionId',
+                },
+                id: null,
+              });
+            }
+          });
+
           // Start the server
           app.listen(PORT, () => {
             log(`LightRAG MCP Server started successfully`);
             log(`Server is listening on port ${PORT}`);
             log(`Health check endpoint available at http://localhost:${PORT}/health`);
             log(`MCP endpoint available at http://localhost:${PORT}/mcp`);
+            log(`Legacy SSE endpoint available at http://localhost:${PORT}/sse`);
+            log(`Legacy messages endpoint available at http://localhost:${PORT}/messages`);
             log(`Server is ready to accept requests`);
           });
+
     environment:
       - LIGHTRAG_API_URL=http://lightrag:9621
       - LIGHTRAG_API_KEY=${SERVICE_BASE64_LIGHTRAG}
