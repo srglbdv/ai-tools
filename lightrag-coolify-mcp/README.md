@@ -85,24 +85,22 @@ This setup includes a Model Context Protocol (MCP) server that provides direct i
 The MCP server provides the following tools:
 
 1. **query_lightrag**: Query the LightRAG knowledge base
-   - Parameters:
-     - `query`: The query to send to LightRAG
-     - `mode`: Retrieval mode (local, global, hybrid, mix, naive)
-
 2. **list_documents**: List all documents in LightRAG
-   - Parameters:
-     - `limit`: Maximum number of documents to return (default: 10)
-     - `offset`: Number of documents to skip (default: 0)
-
 3. **upload_document**: Upload a document to LightRAG
-   - Parameters:
-     - `content`: Document content
-     - `filename`: Document filename
-     - `metadata`: Optional document metadata
-
-4. **get_document_status**: Get the processing status of a document
-   - Parameters:
-     - `document_id`: Document ID
+4. **scan_documents**: Scan for new documents in the document directory
+5. **insert_text**: Insert a single text snippet into LightRAG
+6. **insert_texts**: Insert multiple text snippets into LightRAG
+7. **insert_file**: Insert a single file into LightRAG
+8. **insert_file_batch**: Insert multiple files into LightRAG
+9. **get_pipeline_status**: Get the status of the document processing pipeline
+10. **clear_cache**: Clear the LightRAG query cache
+11. **clear_documents**: Clear all documents from LightRAG
+12. **query_stream**: Query LightRAG with streaming response
+13. **get_graph_labels**: Get all labels in the knowledge graph
+14. **get_knowledge_graph**: Get the knowledge graph for a specific label
+15. **check_entity_exists**: Check if an entity exists in the knowledge graph
+16. **update_entity**: Update an entity in the knowledge graph
+17. **update_relation**: Update a relation in the knowledge graph
 
 ### Setting Up MCP Integration
 
@@ -123,7 +121,7 @@ To use the MCP server with an AI assistant like Claude:
        "lightrag": {
          "url": "https://your-coolify-domain.com/mcp",
          "headers": {
-           "Authorization": "Bearer your-lightrag-api-key"
+           "Authorization": "Bearer your-mcp-api-key"
          },
          "disabled": false,
          "autoApprove": []
@@ -139,7 +137,7 @@ To use the MCP server with an AI assistant like Claude:
        "lightrag": {
          "url": "https://your-coolify-domain.com/sse",
          "headers": {
-           "Authorization": "Bearer your-lightrag-api-key"
+           "Authorization": "Bearer your-mcp-api-key"
          },
          "disabled": false,
          "autoApprove": []
@@ -169,15 +167,11 @@ This method uses the built-in MCP integration in n8n for a more user-friendly ex
    - **Connection Name**: "LightRAG MCP"
    - **Server URL**: The URL where your MCP server is accessible (e.g., `https://your-coolify-domain.com/sse` for legacy clients or `https://your-coolify-domain.com/mcp` for modern clients)
    - **Authentication**: Select "Bearer Token"
-   - **Token**: Your LightRAG API key (the auto-generated value for SERVICE_BASE64_LIGHTRAG)
+   - **Token**: Your MCP API key (the auto-generated value for SERVICE_BASE64_MCP)
 
 3. Configure the MCP node:
    - Select "LightRAG" as the MCP server
-   - Choose the operation you want to perform:
-     - **query_lightrag**: To query the knowledge base
-     - **list_documents**: To list indexed documents
-     - **upload_document**: To add new documents
-     - **get_document_status**: To check processing status
+   - Choose the operation you want to perform from the available tools (query_lightrag, list_documents, upload_document, etc.)
    - Configure the parameters for the selected operation
    - Connect the node to other actions in your workflow
 
@@ -235,7 +229,7 @@ The setup includes several configuration options for document processing:
 4. **Database connectivity**: If using an external PostgreSQL/Supabase database, ensure it's accessible from the Coolify network
 5. **DozerDB issues**: Check the DozerDB logs for any graph database related errors
 6. **MCP server issues**: If the MCP server is not responding, check that LightRAG is healthy and that the API key is correctly configured
-7. **MCP authentication issues**: Ensure the Bearer token in your MCP connection settings matches exactly with the LightRAG API key (the auto-generated SERVICE_BASE64_LIGHTRAG value)
+7. **MCP authentication issues**: Ensure the Bearer token in your MCP connection settings matches exactly with the MCP API key (the auto-generated SERVICE_BASE64_MCP value)
 
 ## References
 

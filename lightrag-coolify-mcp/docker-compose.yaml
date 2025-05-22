@@ -73,6 +73,7 @@ services:
       - MAX_TOKENS=${MAX_TOKENS:-32768}
       - LLM_BINDING=${LLM_BINDING:-openai}
       - LLM_MODEL=${LLM_MODEL:-gpt-4.1-mini}
+      - LLM_MODEL_BACKUP=${LLM_MODEL_BACKUP:-google/gemini-2.5-flash-preview,openai/gpt-4.1-nano}
       - LLM_BINDING_HOST=${LLM_BINDING_HOST:-https://api.openai.com/v1}
       - LLM_BINDING_API_KEY=${LLM_BINDING_API_KEY}
       # Embedding Configuration - Using OpenAI for embeddings
@@ -135,7 +136,8 @@ services:
     build:
       context: .
       dockerfile_inline: |
-        FROM node:24-slim
+        # Build stage
+        FROM node:22-slim AS builder
         
         WORKDIR /app
         
@@ -154,6 +156,19 @@ services:
         
         # Build TypeScript code
         RUN npm run build
+        
+        # Runtime stage
+        FROM node:22-slim
+        
+        WORKDIR /app
+        
+        # Install only production dependencies
+        COPY ./mcp/package.json .
+        RUN npm install --production && \
+            apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+        
+        # Copy built files from builder stage
+        COPY --from=builder /app/build ./build
         
         # Expose HTTP port
         EXPOSE 3000
@@ -215,33 +230,47 @@ services:
           import { z } from "zod";
 
           const API_URL = process.env.LIGHTRAG_API_URL || "http://lightrag:9621";
-          const API_KEY = process.env.LIGHTRAG_API_KEY;
+          const LIGHTRAG_API_KEY = process.env.LIGHTRAG_API_KEY;
+          const MCP_API_KEY = process.env.MCP_API_KEY;
           const PORT = process.env.PORT || 3000;
 
-          if (!API_KEY) {
+          if (!LIGHTRAG_API_KEY) {
             throw new Error("LIGHTRAG_API_KEY environment variable is required");
           }
 
-          // Define types for parameters
-          type QueryLightRAGParams = {
-            query: string;
-            mode?: "local" | "global" | "hybrid" | "mix" | "naive";
-          };
+          if (!MCP_API_KEY) {
+            throw new Error("MCP_API_KEY environment variable is required");
+          }
 
-          type ListDocumentsParams = {
-            limit?: number;
-            offset?: number;
-          };
+          // Create a single reusable function to get a configured axios instance
+          function getLightRAGClient(isFormData = false) {
+            const headers: Record<string, string> = {
+              "X-API-Key": LIGHTRAG_API_KEY as string,
+            };
+            
+            // Add Content-Type header only for non-form data requests
+            if (!isFormData) {
+              headers["Content-Type"] = "application/json";
+            }
+            
+            return axios.create({
+              baseURL: API_URL,
+              headers,
+            });
+          }
 
-          type UploadDocumentParams = {
-            content: string;
-            filename: string;
-            metadata?: Record<string, any>;
-          };
-
-          type DocumentIdParams = {
-            document_id: string;
-          };
+          // Helper function to format response data into MCP content format
+          function formatResponse(data: any, isError: boolean = false) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(data, null, 2)
+                }
+              ],
+              isError
+            };
+          }
 
           // Store transports for each session type
           const transports = {
@@ -266,67 +295,66 @@ services:
                   .default("hybrid")
                   .optional()
               },
-              async ({ query, mode }) => {
-                const axiosInstance = axios.create({
-                  baseURL: API_URL,
-                  headers: {
-                    "X-API-Key": API_KEY as string,
-                    "Content-Type": "application/json",
-                  },
-                });
-                
-                const response = await axiosInstance.post("/query", {
-                  query,
-                  mode: mode || "hybrid",
-                });
-                
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: JSON.stringify(response.data, null, 2),
-                    },
-                  ],
-                };
+              async (args) => {
+                try {
+                  const { query, mode } = args;
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.post("/query", {
+                    query,
+                    mode: mode || "hybrid",
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error querying LightRAG: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
               }
             );
             
             server.tool(
               "list_documents",
-              {
-                limit: z.number()
-                  .describe("Maximum number of documents to return")
-                  .default(10)
-                  .optional(),
-                offset: z.number()
-                  .describe("Number of documents to skip")
-                  .default(0)
-                  .optional()
-              },
-              async ({ limit, offset }) => {
-                const axiosInstance = axios.create({
-                  baseURL: API_URL,
-                  headers: {
-                    "X-API-Key": API_KEY as string,
-                    "Content-Type": "application/json",
-                  },
-                });
-                
-                const actualLimit = limit || 10;
-                const actualOffset = offset || 0;
-                
-                const response = await axiosInstance.get("/documents", {
-                  params: { limit: actualLimit, offset: actualOffset },
-                });
-                
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: JSON.stringify(response.data, null, 2),
-                    },
-                  ],
-                };
+              {},
+              async (args) => {
+                try {
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.get("/documents");
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error listing documents: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
               }
             );
             
@@ -334,73 +362,591 @@ services:
               "upload_document",
               {
                 content: z.string().describe("Document content"),
-                filename: z.string().describe("Document filename"),
-                metadata: z.record(z.any()).describe("Optional document metadata").optional()
+                filename: z.string().describe("Document filename")
               },
-              async ({ content, filename, metadata }) => {
-                const axiosInstance = axios.create({
-                  baseURL: API_URL,
-                  headers: {
-                    "X-API-Key": API_KEY as string,
-                  },
-                });
-                
-                const formData = new FormData();
-                
-                // Create a Buffer from the content string
-                const buffer = Buffer.from(content);
-                formData.append("file", buffer, filename);
-                
-                if (metadata) {
-                  formData.append("metadata", JSON.stringify(metadata));
+              async (args) => {
+                try {
+                  const { content, filename } = args;
+                  const client = getLightRAGClient(true);
+                  
+                  const formData = new FormData();
+                  
+                  // Create a Buffer from the content string
+                  const buffer = Buffer.from(content);
+                  formData.append("file", buffer, filename);
+                  
+                  const response = await client.post("/documents/upload", formData, {
+                    headers: {
+                      ...formData.getHeaders(),
+                    },
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error uploading document: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
                 }
-                
-                const response = await axiosInstance.post("/documents", formData, {
-                  headers: {
-                    ...formData.getHeaders(),
-                  },
-                });
-                
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: JSON.stringify(response.data, null, 2),
-                    },
-                  ],
-                };
-              }
-            );
-            
-            server.tool(
-              "get_document_status",
-              {
-                document_id: z.string().describe("Document ID")
-              },
-              async ({ document_id }) => {
-                const axiosInstance = axios.create({
-                  baseURL: API_URL,
-                  headers: {
-                    "X-API-Key": API_KEY as string,
-                    "Content-Type": "application/json",
-                  },
-                });
-                
-                const response = await axiosInstance.get(
-                  `/documents/${document_id}/status`
-                );
-                
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: JSON.stringify(response.data, null, 2),
-                    },
-                  ],
-                };
               }
             );
 
+            // Add scan_documents tool
+            server.tool(
+              "scan_documents",
+              {},
+              async (args) => {
+                try {
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.post("/documents/scan");
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error scanning documents: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add insert_text tool
+            server.tool(
+              "insert_text",
+              {
+                text: z.string().describe("The text to insert")
+              },
+              async (args) => {
+                try {
+                  const { text } = args;
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.post("/documents/text", {
+                    text
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error inserting text: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add insert_texts tool
+            server.tool(
+              "insert_texts",
+              {
+                texts: z.array(z.string()).describe("List of texts to insert")
+              },
+              async (args) => {
+                try {
+                  const { texts } = args;
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.post("/documents/texts", {
+                    texts
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error inserting texts: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add insert_file tool
+            server.tool(
+              "insert_file",
+              {
+                content: z.string().describe("File content"),
+                filename: z.string().describe("File name")
+              },
+              async (args) => {
+                try {
+                  const { content, filename } = args;
+                  const client = getLightRAGClient(true);
+                  
+                  const formData = new FormData();
+                  
+                  // Create a Buffer from the content string
+                  const buffer = Buffer.from(content);
+                  formData.append("file", buffer, filename);
+                  
+                  const response = await client.post("/documents/file", formData, {
+                    headers: {
+                      ...formData.getHeaders(),
+                    },
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error inserting file: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add insert_file_batch tool
+            server.tool(
+              "insert_file_batch",
+              {
+                files: z.array(
+                  z.object({
+                    content: z.string().describe("File content"),
+                    filename: z.string().describe("File name")
+                  })
+                ).describe("List of files to process")
+              },
+              async (args) => {
+                try {
+                  const { files } = args;
+                  const client = getLightRAGClient(true);
+                  
+                  const formData = new FormData();
+                  
+                  // Add each file to the form data
+                  files.forEach((file, index) => {
+                    const buffer = Buffer.from(file.content);
+                    formData.append("files", buffer, file.filename);
+                  });
+                  
+                  const response = await client.post("/documents/file_batch", formData, {
+                    headers: {
+                      ...formData.getHeaders(),
+                    },
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error inserting file batch: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add get_pipeline_status tool
+            server.tool(
+              "get_pipeline_status",
+              {},
+              async (args) => {
+                try {
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.get("/documents/pipeline_status");
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error getting pipeline status: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add clear_cache tool
+            server.tool(
+              "clear_cache",
+              {
+                modes: z.array(
+                  z.enum(["default", "naive", "local", "global", "hybrid", "mix"])
+                ).describe("Modes of cache to clear").optional()
+              },
+              async (args) => {
+                try {
+                  const { modes } = args;
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.post("/documents/clear_cache", {
+                    modes
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error clearing cache: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add clear_documents tool
+            server.tool(
+              "clear_documents",
+              {},
+              async (args) => {
+                try {
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.delete("/documents");
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error clearing documents: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add query_stream tool
+            server.tool(
+              "query_stream",
+              {
+                query: z.string().describe("The query to send to LightRAG"),
+                mode: z.enum(["local", "global", "hybrid", "mix", "naive", "bypass"])
+                  .describe("Retrieval mode")
+                  .default("hybrid")
+                  .optional()
+              },
+              async (args) => {
+                try {
+                  const { query, mode } = args;
+                  const client = getLightRAGClient();
+                  
+                  // Note: This is a simplified implementation as streaming requires special handling
+                  const response = await client.post("/query/stream", {
+                    query,
+                    mode: mode || "hybrid",
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error streaming query: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add get_graph_labels tool
+            server.tool(
+              "get_graph_labels",
+              {},
+              async (args) => {
+                try {
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.get("/graph/label/list");
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error getting graph labels: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add get_knowledge_graph tool
+            server.tool(
+              "get_knowledge_graph",
+              {
+                label: z.string().describe("Label to get knowledge graph for"),
+                max_depth: z.number().min(1).describe("Maximum depth of graph").default(3).optional(),
+                max_nodes: z.number().min(1).describe("Maximum nodes to return").default(1000).optional()
+              },
+              async (args) => {
+                try {
+                  const { label, max_depth, max_nodes } = args;
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.get("/graphs", {
+                    params: {
+                      label,
+                      max_depth: max_depth || 3,
+                      max_nodes: max_nodes || 1000
+                    }
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error getting knowledge graph: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add check_entity_exists tool
+            server.tool(
+              "check_entity_exists",
+              {
+                name: z.string().describe("Entity name to check")
+              },
+              async (args) => {
+                try {
+                  const { name } = args;
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.get("/graph/entity/exists", {
+                    params: { name }
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error checking entity existence: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add update_entity tool
+            server.tool(
+              "update_entity",
+              {
+                entity_name: z.string().describe("Entity name"),
+                updated_data: z.record(z.any()).describe("Updated data"),
+                allow_rename: z.boolean().describe("Allow rename").default(false).optional()
+              },
+              async (args) => {
+                try {
+                  const { entity_name, updated_data, allow_rename } = args;
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.post("/graph/entity/edit", {
+                    entity_name,
+                    updated_data,
+                    allow_rename: allow_rename || false
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error updating entity: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
+            // Add update_relation tool
+            server.tool(
+              "update_relation",
+              {
+                source_id: z.string().describe("Source ID"),
+                target_id: z.string().describe("Target ID"),
+                updated_data: z.record(z.any()).describe("Updated data")
+              },
+              async (args) => {
+                try {
+                  const { source_id, target_id, updated_data } = args;
+                  const client = getLightRAGClient();
+                  
+                  const response = await client.post("/graph/relation/edit", {
+                    source_id,
+                    target_id,
+                    updated_data
+                  });
+                  
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: JSON.stringify(response.data, null, 2)
+                      }
+                    ]
+                  };
+                } catch (error: any) {
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: `Error updating relation: ${error.message}`
+                      }
+                    ],
+                    isError: true
+                  };
+                }
+              }
+            );
+            
             return server;
           }
 
@@ -416,7 +962,7 @@ services:
           // Add authentication middleware
           function authenticate(req: Request, res: Response, next: Function) {
             const authHeader = req.headers['authorization'];
-            if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+            if (!authHeader || authHeader !== `Bearer ${MCP_API_KEY}`) {
               return res.status(401).json({
                 jsonrpc: '2.0',
                 error: {
@@ -620,6 +1166,7 @@ services:
     environment:
       - LIGHTRAG_API_URL=http://lightrag:9621
       - LIGHTRAG_API_KEY=${SERVICE_BASE64_LIGHTRAG}
+      - MCP_API_KEY=${SERVICE_BASE64_MCP}
       - PORT=3000
       - SERVICE_FQDN_MCP_3000
     entrypoint: ["npm", "start"]
