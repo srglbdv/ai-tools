@@ -73,7 +73,6 @@ services:
       - MAX_TOKENS=${MAX_TOKENS:-32768}
       - LLM_BINDING=${LLM_BINDING:-openai}
       - LLM_MODEL=${LLM_MODEL:-gpt-4.1-mini}
-      - LLM_MODEL_BACKUP=${LLM_MODEL_BACKUP:-google/gemini-2.5-flash-preview,openai/gpt-4.1-nano}
       - LLM_BINDING_HOST=${LLM_BINDING_HOST:-https://api.openai.com/v1}
       - LLM_BINDING_API_KEY=${LLM_BINDING_API_KEY}
       # Embedding Configuration - Using OpenAI for embeddings
