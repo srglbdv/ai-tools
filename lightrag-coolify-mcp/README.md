@@ -76,6 +76,45 @@ This setup uses DozerDB (a Neo4j variant) for knowledge graph storage. DozerDB w
 - File import/export capabilities
 - Unrestricted security procedures for full functionality
 
+### Backup Configuration
+
+This setup includes an automated backup system for the Neo4j/DozerDB knowledge graph databases. 
+
+#### Backup Setup
+
+To enable automated backups, configure the following environment variables:
+
+**Required Variables:**
+- `AWS_S3_BUCKET`: Your S3 bucket name for storing backups
+- `AWS_ACCESS_KEY_ID`: AWS access key ID or compatible service credentials
+- `AWS_SECRET_ACCESS_KEY`: AWS secret access key or compatible service credentials
+
+**Optional Variables:**
+- `AWS_S3_PREFIX`: Prefix for backup files in the bucket (default: "backups")
+- `AWS_S3_REGION`: AWS region or compatible service region (default: "us-east-1")
+- `AWS_S3_ENDPOINT`: Custom endpoint for S3-compatible services (e.g., Cloudflare R2)
+
+#### Manual Backup Execution
+
+To run a manual backup, execute the backup script inside the Neo4j container:
+
+```bash
+# Access the Neo4j container
+docker exec -it your-neo4j-container-name /bin/bash
+
+# Run the backup script
+/usr/local/bin/neo4j_backup.sh
+```
+
+#### Backup Monitoring
+
+Backup operations are logged to `/logs/backup.log` inside the Neo4j container. You can monitor backup status by checking the logs:
+
+```bash
+# View backup logs
+docker exec -it your-neo4j-container-name tail -f /logs/backup.log
+```
+
 ## MCP Server Integration
 
 This setup includes a Model Context Protocol (MCP) server that provides direct integration with LightRAG through AI assistants like Claude. The MCP server exposes tools that allow AI assistants to interact with your LightRAG deployment programmatically.
@@ -230,6 +269,12 @@ The setup includes several configuration options for document processing:
 5. **DozerDB issues**: Check the DozerDB logs for any graph database related errors
 6. **MCP server issues**: If the MCP server is not responding, check that LightRAG is healthy and that the API key is correctly configured
 7. **MCP authentication issues**: Ensure the Bearer token in your MCP connection settings matches exactly with the MCP API key (the auto-generated SERVICE_BASE64_MCP value)
+8. **Backup issues**: If backups are failing, check:
+   - AWS credentials are correctly configured (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
+   - S3 bucket exists and is accessible (`AWS_S3_BUCKET`)
+   - For S3-compatible services, verify the endpoint URL (`AWS_S3_ENDPOINT`)
+   - Check backup logs: `docker exec -it your-neo4j-container-name tail -f /logs/backup.log`
+   - Ensure the Neo4j container has sufficient disk space for temporary backup files
 
 ## References
 

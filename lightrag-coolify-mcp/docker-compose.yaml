@@ -111,7 +111,26 @@ services:
     entrypoint: ["python", "-m", "lightrag.api.lightrag_server"]
 
   neo4j:
-    image: graphstack/dozerdb:5.26.3.0
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM graphstack/dozerdb:5.26.3.0
+        
+        # Install AWS CLI and dependencies for backup functionality
+        USER root
+        RUN apt-get update && apt-get install -y \
+            curl \
+            unzip \
+            && rm -rf /var/lib/apt/lists/*
+        
+        # Install AWS CLI v2
+        RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
+            && unzip awscliv2.zip \
+            && ./aws/install \
+            && rm -rf awscliv2.zip aws
+        
+        # Switch back to neo4j user
+        USER neo4j
     restart: unless-stopped
     environment:
       - NEO4J_AUTH=neo4j/${SERVICE_PASSWORD_NEO4J}
@@ -119,11 +138,385 @@ services:
       - NEO4J_apoc_export_file_enabled=true
       - NEO4J_apoc_import_file_enabled=true
       - NEO4J_dbms_security_procedures_unrestricted='*'
+      # Backup configuration
+      - AWS_S3_BUCKET=${AWS_S3_BUCKET:-}
+      - AWS_S3_PREFIX=${AWS_S3_PREFIX:-backups}
+      - AWS_S3_REGION=${AWS_S3_REGION:-us-east-1}
+      - AWS_S3_ENDPOINT=${AWS_S3_ENDPOINT:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - ADMIN_PASSWORD=${SERVICE_PASSWORD_NEO4J}
     volumes:
       - neo4j-data:/data
       - neo4j-logs:/logs
       - neo4j-plugins:/plugins
       - neo4j-import:/var/lib/neo4j/import
+      - type: bind
+        source: ./neo4j_backup.sh
+        target: /usr/local/bin/neo4j_backup.sh
+        content: |
+          #!/bin/bash
+
+          # Neo4j Backup Script
+          # Dumps Neo4j databases, compresses them, and uploads to S3
+
+          set -euo pipefail
+
+          # Configuration
+          AWS_S3_BUCKET="${AWS_S3_BUCKET:-your-backup-bucket}"
+          AWS_S3_PREFIX="${AWS_S3_PREFIX:-backups}"
+          AWS_S3_REGION="${AWS_S3_REGION:-us-east-1}"
+          AWS_S3_ENDPOINT="${AWS_S3_ENDPOINT:-}"  # Optional: for S3-compatible services
+          AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
+          AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
+          NEO4J_PASSWORD="${ADMIN_PASSWORD:-neo4j}"
+          RETENTION_COUNT=3
+          LOG_FILE="/logs/backup.log"
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          BACKUP_DIR="/tmp/neo4j-backups"
+          BACKUP_NAME="neo4j_backup_${TIMESTAMP}"
+
+          # Logging function
+          log() {
+              local level=$1
+              shift
+              local message="$*"
+              local log_entry="$(date '+%Y-%m-%d %H:%M:%S') ${level} ${message}"
+              echo "${log_entry}" | tee -a "${LOG_FILE}"
+          }
+
+          # Error handling with database restart
+          cleanup_on_error() {
+              local exit_code=$?
+              log "ERROR" "Backup process failed with exit code: ${exit_code}"
+              
+              # Ensure Neo4j service is restarted even on error
+              log "INFO" "Attempting to restart Neo4j service after error..."
+              restart_database || log "WARN" "Failed to restart Neo4j service after error"
+              
+              # Clean up temporary files
+              if [[ -d "${BACKUP_DIR}/${BACKUP_NAME}" ]]; then
+                  rm -rf "${BACKUP_DIR}/${BACKUP_NAME}"
+                  log "INFO" "Cleaned up temporary backup directory"
+              fi
+              
+              if [[ -f "${BACKUP_DIR}/${BACKUP_NAME}.tar.gz" ]]; then
+                  rm -f "${BACKUP_DIR}/${BACKUP_NAME}.tar.gz"
+                  log "INFO" "Cleaned up temporary compressed backup"
+              fi
+              
+              exit ${exit_code}
+          }
+
+          trap cleanup_on_error ERR
+
+          # Configure and validate AWS credentials
+          configure_aws_credentials() {
+              
+              # Check if credentials are set
+              if [[ -z "${AWS_ACCESS_KEY_ID}" || -z "${AWS_SECRET_ACCESS_KEY}" ]]; then
+                  log "ERROR" "AWS credentials not set: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY required"
+                  return 1
+              fi
+              
+              # Configure AWS CLI
+              aws configure set aws_access_key_id "${AWS_ACCESS_KEY_ID}"
+              aws configure set aws_secret_access_key "${AWS_SECRET_ACCESS_KEY}"
+              aws configure set default.region "${AWS_S3_REGION:-us-east-1}"
+              
+              # Configure custom endpoint if provided
+              if [[ -n "${AWS_S3_ENDPOINT}" ]]; then
+                  aws configure set default.s3.endpoint_url "${AWS_S3_ENDPOINT}"
+                  log "INFO" "Configured custom S3 endpoint: ${AWS_S3_ENDPOINT}"
+              fi
+              
+              log "INFO" "AWS CLI configuration completed"
+              
+              # Test credentials and bucket access with specific bucket
+              if [[ -n "${AWS_S3_ENDPOINT}" ]]; then
+                  if aws s3 ls "s3://${AWS_S3_BUCKET}/" --endpoint-url="${AWS_S3_ENDPOINT}" >/dev/null 2>&1; then
+                      log "INFO" "AWS credentials and bucket access validated successfully"
+                      return 0
+                  else
+                      log "ERROR" "AWS credentials are invalid, custom S3 endpoint is unreachable, or bucket '${AWS_S3_BUCKET}' is not accessible: ${AWS_S3_ENDPOINT}"
+                      return 1
+                  fi
+              else
+                  if aws s3 ls "s3://${AWS_S3_BUCKET}/" >/dev/null 2>&1; then
+                      log "INFO" "AWS credentials and bucket access validated successfully"
+                      return 0
+                  else
+                      log "ERROR" "AWS credentials are invalid, AWS S3 service is unreachable, or bucket '${AWS_S3_BUCKET}' is not accessible"
+                      return 1
+                  fi
+              fi
+          }
+
+          # Check prerequisites
+          check_prerequisites() {
+              
+              if [[ -z "${NEO4J_PASSWORD}" ]]; then
+                  log "ERROR" "NEO4J_PASSWORD is required for cypher-shell authentication"
+                  exit 1
+              fi
+              
+              # Configure and validate AWS credentials
+              if ! configure_aws_credentials; then
+                  log "ERROR" "AWS credential configuration and validation failed"
+                  exit 1
+              fi
+              
+              # Create backup directory
+              mkdir -p "${BACKUP_DIR}"
+              mkdir -p "$(dirname "${LOG_FILE}")"
+              
+              log "INFO" "Prerequisites check completed successfully"
+          }
+
+          # Stop a specific database
+          stop_database() {
+              local db_name=$1
+
+              if cypher-shell -u neo4j -p "${NEO4J_PASSWORD}" "STOP DATABASE \`${db_name}\`" 2>&1 | tee -a "${LOG_FILE}"; then
+                  # Wait a moment for database to fully start
+                  sleep 10
+
+                  log "INFO" "Successfully stopped ${db_name} database"
+              else
+                  log "ERROR" "Failed to stop ${db_name} database"
+                  return 1
+              fi
+          }
+
+          # Start a specific database using cypher-shell
+          start_database() {
+              local db_name=$1
+              
+              if cypher-shell -u neo4j -p "${NEO4J_PASSWORD}" "START DATABASE \`${db_name}\`" 2>&1 | tee -a "${LOG_FILE}"; then
+                  # Wait a moment for database to fully start
+                  sleep 10
+
+                  log "INFO" "Successfully started ${db_name} database"
+              else
+                  log "ERROR" "Failed to start ${db_name} database"
+                  return 1
+              fi
+          }
+
+          # Restart Neo4j service using neo4j restart command
+          restart_database() {
+              log "INFO" "Restarting Neo4j service"
+              
+              if neo4j restart 2>&1 | tee -a "${LOG_FILE}"; then
+                  # Wait longer for service restart
+                  sleep 30
+
+                  log "INFO" "Successfully restarted Neo4j service"
+              else
+                  log "ERROR" "Failed to restart Neo4j service"
+                  return 1
+              fi
+          }
+
+          # Dump a specific database
+          dump_database() {
+              local db_name=$1
+              log "INFO" "Dumping ${db_name} database to: ${BACKUP_DIR}/${BACKUP_NAME}"
+              
+              # Create backup directory if it doesn't exist
+              mkdir -p "${BACKUP_DIR}/${BACKUP_NAME}"
+              
+              if neo4j-admin database dump "${db_name}" --to-path="${BACKUP_DIR}/${BACKUP_NAME}" 2>&1 | tee -a "${LOG_FILE}"; then
+                  log "INFO" "Successfully dumped ${db_name} database"
+              else
+                  log "ERROR" "Failed to dump ${db_name} database"
+                  return 1
+              fi
+          }
+
+          # Backup a single database
+          backup_database() {
+              local db_name=$1
+              log "INFO" "Starting backup for database: ${db_name}"
+              
+              # Start the database (ensure it's running)
+              if ! start_database "${db_name}"; then
+                  log "ERROR" "Failed to start ${db_name} database before backup"
+                  return 1
+              fi
+              
+              # Stop the database
+              if ! stop_database "${db_name}"; then
+                  log "ERROR" "Failed to stop ${db_name} database"
+                  return 1
+              fi
+              
+              # Dump the database
+              if ! dump_database "${db_name}"; then
+                  log "ERROR" "Failed to dump ${db_name} database"
+                  return 1
+              fi
+              
+              
+              log "INFO" "Completed backup for database: ${db_name}"
+          }
+
+          # Compress backup
+          compress_backup() {
+              log "INFO" "Compressing backup to: ${BACKUP_DIR}/${BACKUP_NAME}.tar.gz"
+              
+              if tar -czf "${BACKUP_DIR}/${BACKUP_NAME}.tar.gz" -C "${BACKUP_DIR}/${BACKUP_NAME}" . 2>&1 | tee -a "${LOG_FILE}"; then
+                  log "INFO" "Successfully compressed backup"
+                  
+                  # Get compressed file size for logging
+                  local file_size
+                  file_size=$(du -h "${BACKUP_DIR}/${BACKUP_NAME}.tar.gz" | cut -f1)
+                  log "INFO" "Compressed backup size: ${file_size}"
+                  
+                  # Remove uncompressed backup directory
+                  rm -rf "${BACKUP_DIR}/${BACKUP_NAME}"
+                  log "INFO" "Cleaned up uncompressed backup directory"
+              else
+                  log "ERROR" "Failed to compress backup"
+                  return 1
+              fi
+          }
+
+          # Upload to S3
+          upload_to_s3() {
+              local s3_key="${AWS_S3_PREFIX}/${BACKUP_NAME}.tar.gz"
+              
+              log "INFO" "Uploading compressed backup to S3: s3://${AWS_S3_BUCKET}/${s3_key}"
+              
+              # Build upload command with endpoint if needed
+              # Add CRC32 checksum for compatibility with Cloudflare R2 and other S3-compatible services
+              if [[ -n "${AWS_S3_ENDPOINT}" ]]; then
+                  if aws s3 cp "${BACKUP_DIR}/${BACKUP_NAME}.tar.gz" "s3://${AWS_S3_BUCKET}/${s3_key}" --endpoint-url="${AWS_S3_ENDPOINT}" --checksum-algorithm CRC32 2>&1 | tee -a "${LOG_FILE}"; then
+                      log "INFO" "Successfully uploaded backup to S3"
+                      
+                      # Remove local compressed backup after successful upload
+                      rm -f "${BACKUP_DIR}/${BACKUP_NAME}.tar.gz"
+                      log "INFO" "Cleaned up local compressed backup"
+                  else
+                      log "ERROR" "Failed to upload backup to S3"
+                      return 1
+                  fi
+              else
+                  if aws s3 cp "${BACKUP_DIR}/${BACKUP_NAME}.tar.gz" "s3://${AWS_S3_BUCKET}/${s3_key}" 2>&1 | tee -a "${LOG_FILE}"; then
+                      log "INFO" "Successfully uploaded backup to S3"
+                      
+                      # Remove local compressed backup after successful upload
+                      rm -f "${BACKUP_DIR}/${BACKUP_NAME}.tar.gz"
+                      log "INFO" "Cleaned up local compressed backup"
+                  else
+                      log "ERROR" "Failed to upload backup to S3"
+                      return 1
+                  fi
+              fi
+          }
+
+          # Clean up old backups in S3
+          cleanup_old_backups() {
+              log "INFO" "Cleaning up old backups (keeping last ${RETENTION_COUNT} versions)..."
+              
+              # Prepare endpoint arguments
+              local endpoint_args=""
+              if [[ -n "${AWS_S3_ENDPOINT}" ]]; then
+                  endpoint_args="--endpoint-url=${AWS_S3_ENDPOINT}"
+              fi
+              
+              # List all backup files in S3, sorted by date (newest first)
+              local backup_objects
+              backup_objects=$(aws s3api list-objects-v2 \
+                  --bucket "${AWS_S3_BUCKET}" \
+                  --prefix "${AWS_S3_PREFIX}/neo4j_backup_" \
+                  ${endpoint_args} \
+                  --query 'Contents[?ends_with(Key, `.tar.gz`)].Key' \
+                  --output text 2>/dev/null | tr '\t' '\n' | sort -r || true)
+              
+              if [[ -z "${backup_objects}" ]]; then
+                  log "INFO" "No existing backups found in S3"
+                  return 0
+              fi
+              
+              local count=0
+              local objects_to_delete=()
+              
+              while IFS= read -r object; do
+                  [[ -z "${object}" ]] && continue
+                  count=$((count + 1))
+                  if [[ ${count} -gt ${RETENTION_COUNT} ]]; then
+                      objects_to_delete+=("${object}")
+                  fi
+              done <<< "${backup_objects}"
+              
+              if [[ ${#objects_to_delete[@]} -gt 0 ]]; then
+                  log "INFO" "Deleting ${#objects_to_delete[@]} old backup(s)..."
+                  for object in "${objects_to_delete[@]}"; do
+                      if [[ -n "${AWS_S3_ENDPOINT}" ]]; then
+                          if aws s3 rm "s3://${AWS_S3_BUCKET}/${object}" --endpoint-url="${AWS_S3_ENDPOINT}" 2>&1 | tee -a "${LOG_FILE}"; then
+                              log "INFO" "Deleted old backup: ${object}"
+                          else
+                              log "WARN" "Failed to delete old backup: ${object}"
+                          fi
+                      else
+                          if aws s3 rm "s3://${AWS_S3_BUCKET}/${object}" 2>&1 | tee -a "${LOG_FILE}"; then
+                              log "INFO" "Deleted old backup: ${object}"
+                          else
+                              log "WARN" "Failed to delete old backup: ${object}"
+                          fi
+                      fi
+                  done
+              else
+                  log "INFO" "No old backups to clean up"
+              fi
+          }
+
+          # Main execution
+          main() {
+              log "INFO" "Starting Neo4j backup process"
+              log "INFO" "Backup name: ${BACKUP_NAME}"
+              log "INFO" "Target bucket: s3://${AWS_S3_BUCKET}/${AWS_S3_PREFIX}"
+              
+              # Check prerequisites
+              check_prerequisites
+              
+              # Backup each database individually
+              if ! backup_database "chunk-entity-relation"; then
+                  log "ERROR" "Failed to backup chunk-entity-relation database"
+                  exit 1
+              fi
+              
+              if ! backup_database "neo4j"; then
+                  log "ERROR" "Failed to backup neo4j database"
+                  exit 1
+              fi
+              
+              # Compress backup
+              if ! compress_backup; then
+                  log "ERROR" "Backup compression failed"
+                  exit 1
+              fi
+              
+              # Upload to S3
+              if ! upload_to_s3; then
+                  log "ERROR" "S3 upload failed"
+                  exit 1
+              fi
+              
+              # Clean up old backups
+              cleanup_old_backups
+              
+              # Restart Neo4j service after all backups are complete
+              if ! restart_database; then
+                  log "ERROR" "Failed to restart Neo4j service after backup completion"
+                  exit 1
+              fi
+              
+          }
+
+          # Execute main function
+          main "$@"
     healthcheck:
       test: wget http://localhost:7474 || exit 1
       interval: 10s
@@ -289,20 +682,48 @@ services:
               "query_lightrag",
               {
                 query: z.string().describe("The query to send to LightRAG"),
-                mode: z.enum(["local", "global", "hybrid", "mix", "naive"])
-                  .describe("Retrieval mode (local, global, hybrid, mix, naive)")
-                  .default("hybrid")
+                conversation_history: z.array(z.record(z.any()))
+                  .describe("Conversation history")
+                  .optional(),
+                ids: z.array(z.string())
+                  .describe("Specific document IDs to query")
                   .optional()
               },
               async (args) => {
                 try {
-                  const { query, mode } = args;
                   const client = getLightRAGClient();
                   
-                  const response = await client.post("/query", {
-                    query,
-                    mode: mode || "hybrid",
-                  });
+                  // Read environment variables for query parameters
+                  const queryParams = {
+                    query: args.query,
+                    conversation_history: args.conversation_history,
+                    ids: args.ids,
+                    mode: process.env.MCP_QUERY_MODE || "hybrid",
+                    only_need_context: process.env.MCP_QUERY_ONLY_NEED_CONTEXT === "true",
+                    only_need_prompt: process.env.MCP_QUERY_ONLY_NEED_PROMPT === "true",
+                    response_type: process.env.MCP_QUERY_RESPONSE_TYPE,
+                    top_k: process.env.MCP_QUERY_TOP_K ? parseInt(process.env.MCP_QUERY_TOP_K) : undefined,
+                    max_token_for_text_unit: process.env.MCP_QUERY_MAX_TOKEN_FOR_TEXT_UNIT ? 
+                      parseInt(process.env.MCP_QUERY_MAX_TOKEN_FOR_TEXT_UNIT) : undefined,
+                    max_token_for_global_context: process.env.MCP_QUERY_MAX_TOKEN_FOR_GLOBAL_CONTEXT ? 
+                      parseInt(process.env.MCP_QUERY_MAX_TOKEN_FOR_GLOBAL_CONTEXT) : undefined,
+                    max_token_for_local_context: process.env.MCP_QUERY_MAX_TOKEN_FOR_LOCAL_CONTEXT ? 
+                      parseInt(process.env.MCP_QUERY_MAX_TOKEN_FOR_LOCAL_CONTEXT) : undefined,
+                    history_turns: process.env.MCP_QUERY_HISTORY_TURNS ? 
+                      parseInt(process.env.MCP_QUERY_HISTORY_TURNS) : undefined,
+                    user_prompt: process.env.MCP_QUERY_USER_PROMPT
+                  };
+                  
+                  // Filter out undefined values and empty arrays
+                  const filteredParams = Object.fromEntries(
+                    Object.entries(queryParams).filter(([k, v]) => {
+                      if (v === undefined) return false;
+                      if (Array.isArray(v) && v.length === 0) return false;
+                      return true;
+                    })
+                  );
+
+                  const response = await client.post("/query", filteredParams);
                   
                   return {
                     content: [
@@ -714,21 +1135,49 @@ services:
               "query_stream",
               {
                 query: z.string().describe("The query to send to LightRAG"),
-                mode: z.enum(["local", "global", "hybrid", "mix", "naive", "bypass"])
-                  .describe("Retrieval mode")
-                  .default("hybrid")
+                conversation_history: z.array(z.record(z.any()))
+                  .describe("Conversation history")
+                  .optional(),
+                ids: z.array(z.string())
+                  .describe("Specific document IDs to query")
                   .optional()
               },
               async (args) => {
                 try {
-                  const { query, mode } = args;
                   const client = getLightRAGClient();
                   
+                  // Read environment variables for query parameters
+                  const queryParams = {
+                    query: args.query,
+                    conversation_history: args.conversation_history,
+                    ids: args.ids,
+                    mode: process.env.MCP_QUERY_MODE || "hybrid",
+                    only_need_context: process.env.MCP_QUERY_ONLY_NEED_CONTEXT === "true",
+                    only_need_prompt: process.env.MCP_QUERY_ONLY_NEED_PROMPT === "true",
+                    response_type: process.env.MCP_QUERY_RESPONSE_TYPE,
+                    top_k: process.env.MCP_QUERY_TOP_K ? parseInt(process.env.MCP_QUERY_TOP_K) : undefined,
+                    max_token_for_text_unit: process.env.MCP_QUERY_MAX_TOKEN_FOR_TEXT_UNIT ? 
+                      parseInt(process.env.MCP_QUERY_MAX_TOKEN_FOR_TEXT_UNIT) : undefined,
+                    max_token_for_global_context: process.env.MCP_QUERY_MAX_TOKEN_FOR_GLOBAL_CONTEXT ? 
+                      parseInt(process.env.MCP_QUERY_MAX_TOKEN_FOR_GLOBAL_CONTEXT) : undefined,
+                    max_token_for_local_context: process.env.MCP_QUERY_MAX_TOKEN_FOR_LOCAL_CONTEXT ? 
+                      parseInt(process.env.MCP_QUERY_MAX_TOKEN_FOR_LOCAL_CONTEXT) : undefined,
+                    history_turns: process.env.MCP_QUERY_HISTORY_TURNS ? 
+                      parseInt(process.env.MCP_QUERY_HISTORY_TURNS) : undefined,
+                    user_prompt: process.env.MCP_QUERY_USER_PROMPT
+                  };
+                  
+                  // Filter out undefined values and empty arrays
+                  const filteredParams = Object.fromEntries(
+                    Object.entries(queryParams).filter(([k, v]) => {
+                      if (v === undefined) return false;
+                      if (Array.isArray(v) && v.length === 0) return false;
+                      return true;
+                    })
+                  );
+                  
                   // Note: This is a simplified implementation as streaming requires special handling
-                  const response = await client.post("/query/stream", {
-                    query,
-                    mode: mode || "hybrid",
-                  });
+                  const response = await client.post("/query/stream", filteredParams);
                   
                   return {
                     content: [
@@ -1168,6 +1617,17 @@ services:
       - MCP_API_KEY=${SERVICE_BASE64_MCP}
       - PORT=3000
       - SERVICE_FQDN_MCP_3000
+      # Query parameters with default values
+      - MCP_QUERY_MODE=${MCP_QUERY_MODE:-hybrid}
+      - MCP_QUERY_ONLY_NEED_CONTEXT=${MCP_QUERY_ONLY_NEED_CONTEXT:-false}
+      - MCP_QUERY_ONLY_NEED_PROMPT=${MCP_QUERY_ONLY_NEED_PROMPT:-false}
+      - MCP_QUERY_RESPONSE_TYPE=${MCP_QUERY_RESPONSE_TYPE:-Multiple Paragraphs}
+      - MCP_QUERY_TOP_K=${MCP_QUERY_TOP_K:-10}
+      - MCP_QUERY_MAX_TOKEN_FOR_TEXT_UNIT=${MCP_QUERY_MAX_TOKEN_FOR_TEXT_UNIT:-4000}
+      - MCP_QUERY_MAX_TOKEN_FOR_GLOBAL_CONTEXT=${MCP_QUERY_MAX_TOKEN_FOR_GLOBAL_CONTEXT:-4000}
+      - MCP_QUERY_MAX_TOKEN_FOR_LOCAL_CONTEXT=${MCP_QUERY_MAX_TOKEN_FOR_LOCAL_CONTEXT:-4000}
+      - MCP_QUERY_HISTORY_TURNS=${MCP_QUERY_HISTORY_TURNS:-3}
+      - MCP_QUERY_USER_PROMPT=${MCP_QUERY_USER_PROMPT:-}
     entrypoint: ["npm", "start"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
